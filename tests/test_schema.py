@@ -25,7 +25,7 @@ class SchemaTest(BaseTest):
         e = best_match(validator.iter_errors(data))
         ex = specific_error(list(validator.iter_errors(data))[0])
         return e, ex
-        
+
     def setUp(self):
         if not self.validator:
             self.validator = Validator(generate())
@@ -61,6 +61,15 @@ class SchemaTest(BaseTest):
             "'skipped_devices': []" in error.message)
         self.assertTrue(
             "'type': 'ebs'" in error.message)
+
+    def test_vars_and_tags(self):
+        data = {
+            'vars': {'alpha': 1, 'beta': 2},
+            'policies': [{
+                'name': 'test',
+                'resource': 'ec2',
+                'tags': ['controls']}]}
+        self.assertEqual(list(self.validator.iter_errors(data)), [])
 
     def test_semantic_error_on_value_derived(self):
         data = {

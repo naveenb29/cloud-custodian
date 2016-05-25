@@ -81,6 +81,63 @@ def generateBucketContents(s3, bucket, contents=None):
 
 class S3Test(BaseTest):
 
+    def test_multipart_large_file(self):
+        self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
+        self.patch(
+            s3.EncryptExtantKeys, 'executor_factory', MainThreadExecutor)        
+        self.patch(s3, 'S3_AUGMENT_TABLE', [])
+        self.patch(s3, 'MAX_COPY_SIZE', (1024 * 1024 * 6.1))
+        session_factory = self.replay_flight_data('test_s3_multipart_file')
+        session = session_factory()
+        client = session.client('s3')
+        bname = 'custodian-largef-test'
+        key = 'hello'
+        client.create_bucket(Bucket=bname)
+        self.addCleanup(destroyBucket, client, bname)
+
+        class wrapper(object):
+            def __init__(self, d, length):
+                self.d = d
+                self.len = length
+                self.counter = length
+                
+            def read(self, size):
+                if self.counter == 0:
+                    return ""
+                if size > self.counter:
+                    size = self.counter
+                    self.counter = 0
+                else:
+                    self.counter -= size
+                return self.d.read(size)
+
+            def seek(self, offset, whence=0):
+                if whence == 2 and offset == 0:
+                    self.counter = 0
+                elif whence == 0 and offset == 0:
+                    self.counter = self.len
+
+            def tell(self):
+                return self.len - self.counter
+            
+        size = 1024 * 1024 * 16
+        client.put_object(
+            Bucket=bname, Key=key,
+            Metadata={'planet': 'earth'},
+            Body=wrapper(open('/dev/zero'), size), ContentLength=size)
+        info = client.head_object(Bucket=bname, Key=key)
+        p = self.load_policy({
+            'name': 'encrypt-obj',
+            'resource': 's3',
+            'filters': [{"Name": bname}],
+            'actions': ['encrypt-keys']}, session_factory=session_factory)
+        p.run()
+        post_info = client.head_object(Bucket=bname, Key='hello')
+        self.assertTrue('ServerSideEncryption' in post_info)
+        self.assertEqual(post_info['Metadata'], {'planet': 'earth'})
+        # etags on multipart do not reflect md5 :-(
+        self.assertTrue(info['ContentLength'], post_info['ContentLength'])
+
     def test_log_target(self):
         self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
         self.patch(s3, 'S3_AUGMENT_TABLE', [
@@ -122,6 +179,45 @@ class S3Test(BaseTest):
         names = [b['Name'] for b in resources]
         self.assertTrue(bname in names)
 
+    def test_has_statement(self):
+        self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
+        self.patch(
+            s3.MissingPolicyStatementFilter, 'executor_factory',
+            MainThreadExecutor)
+        self.patch(s3, 'S3_AUGMENT_TABLE', [
+            ('get_bucket_policy',  'Policy', None, None),
+        ])
+        session_factory = self.replay_flight_data('test_s3_has_statement')
+        bname = "custodian-policy-test"
+        session = session_factory()
+        client = session.client('s3')
+        client.create_bucket(Bucket=bname)
+        self.addCleanup(destroyBucket, client, bname)
+        client.put_bucket_policy(
+            Bucket=bname,
+            Policy=json.dumps({
+                'Version': '2012-10-17',
+                'Statement': [{
+                    'Sid': 'Zebra',
+                    'Effect': 'Deny',
+                    'Principal': '*',
+                    'Action': 's3:PutObject',
+                    'Resource': 'arn:aws:s3:::%s/*' % bname,
+                    'Condition': {
+                        'StringNotEquals': {
+                            's3:x-amz-server-side-encryption': [
+                                'AES256', 'aws:kms']}}}]}))
+        p = self.load_policy({
+            'name': 's3-has-policy',
+            'resource': 's3',
+            'filters': [
+                {'Name': bname},
+                {'type': 'has-statement',
+                 'statement-ids': ['RequireEncryptedPutObject']}]},
+            session_factory=session_factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+
     def test_missing_policy_statement(self):
         self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
         self.patch(
@@ -132,19 +228,31 @@ class S3Test(BaseTest):
         ])
         session_factory = self.replay_flight_data('test_s3_missing_policy')
         bname = "custodian-encrypt-test"
-
         session = session_factory()
         client = session.client('s3')
         client.create_bucket(Bucket=bname)
         self.addCleanup(destroyBucket, client, bname)
-
+        client.put_bucket_policy(
+            Bucket=bname,
+            Policy=json.dumps({
+                'Version': '2012-10-17',
+                'Statement': [{
+                    'Sid': 'Zebra',
+                    'Effect': 'Deny',
+                    'Principal': '*',
+                    'Action': 's3:PutObject',
+                    'Resource': 'arn:aws:s3:::%s/*' % bname,
+                    'Condition': {
+                        'StringNotEquals': {
+                            's3:x-amz-server-side-encryption': [
+                                'AES256', 'aws:kms']}}}]}))
         p = self.load_policy({
             'name': 'encrypt-keys',
             'resource': 's3',
             'filters': [
                 {'Name': bname},
                 {'type': 'missing-policy-statement',
-                 'statement-ids': ['RequireEncryptedPutObject']}]},
+                 'statement_ids': ['RequireEncryptedPutObject']}]},
             session_factory=session_factory)
         resources = p.run()
         self.assertEqual(len(resources), 1)
@@ -257,9 +365,6 @@ class S3Test(BaseTest):
         client.put_object(
             Bucket=bname, Key='hello-world.txt',
             Body='hello world', ContentType='text/plain')
-        # For recording
-        #import time
-        #time.sleep(7)
         info = client.head_object(Bucket=bname, Key='hello-world.txt')
         self.assertTrue('ServerSideEncryption' in info)
 
@@ -280,10 +385,61 @@ class S3Test(BaseTest):
             'filters': [{'Name': bname}],
             'actions': ['encrypt-keys']}, session_factory=session_factory)
         resources = p.run()
+
         self.assertTrue(
             'ServerSideEncryption' in client.head_object(
                 Bucket=bname, Key='home.txt'))
 
+    def test_global_grants_filter_option(self):
+        self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
+        self.patch(s3, 'S3_AUGMENT_TABLE', [
+            ('get_bucket_acl', 'Acl', None, None)
+            ])
+        session_factory = self.replay_flight_data(
+            'test_s3_global_grants_filter')
+        bname = 'custodian-testing-grants'
+        session = session_factory()
+        client = session.client('s3')
+        client.create_bucket(Bucket=bname)
+        self.addCleanup(destroyBucket, client, bname)
+        
+        public = 'http://acs.amazonaws.com/groups/global/AllUsers'
+    
+        client.put_bucket_acl(
+            Bucket=bname,
+            AccessControlPolicy={
+                "Owner": {
+                    "DisplayName": "k_vertigo",
+                    "ID": "904fc4c4790937100e9eb293a15e6a0a1f265a064888055b43d030034f8881ee"
+                },
+                'Grants': [
+                    {'Grantee': {
+                        'Type': 'Group',
+                        'URI': public},
+                     'Permission': 'WRITE'}
+                    ]})
+        p = self.load_policy(
+            {'name': 's3-global-check',
+             'resource': 's3',
+             'filters': [
+                 {'Name': 'custodian-testing-grants'},
+                 {'type': 'global-grants',
+                  'permissions': ['READ_ACP']}]},
+            session_factory=session_factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 0)
+
+        p = self.load_policy(
+            {'name': 's3-global-check',
+             'resource': 's3',
+             'filters': [
+                 {'Name': 'custodian-testing-grants'},
+                 {'type': 'global-grants',
+                  'permissions': ['WRITE']}]},
+            session_factory=session_factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)        
+        
     def test_global_grants_filter_and_remove(self):
         self.patch(s3, 'S3_AUGMENT_TABLE', [
             ('get_bucket_acl', 'Acl', None, None)
@@ -294,6 +450,7 @@ class S3Test(BaseTest):
         session = session_factory()
         client = session.client('s3')
         client.create_bucket(Bucket=bname)
+        
         public = 'http://acs.amazonaws.com/groups/global/AllUsers'
         client.put_bucket_acl(
             Bucket=bname,

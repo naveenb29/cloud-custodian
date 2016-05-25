@@ -110,6 +110,7 @@ class FilterRegistry(PluginRegistry):
             return ValueFilter(data, manager).validate()
         if isinstance(data, basestring):
             filter_type = data
+            data = {'type': data}
         else:
             filter_type = data.get('type')
         if not filter_type:
@@ -143,11 +144,6 @@ class Filter(object):
     def validate(self):
         """validate filter config, return validation error or self"""
         return self
-
-    @property
-    def name(self):
-        """ Name of the filter"""
-        raise NotImplementedError()
 
     def process(self, resources, event=None):
         """ Bulk process resources and return filtered set."""
@@ -246,6 +242,9 @@ class ValueFilter(Filter):
             self.op = self.data.get('op')
             self.v = self.data.get('value')
 
+        if i is None:
+            return False
+
         # Value extract
         if self.k.startswith('tag:'):
             tk = self.k.split(':', 1)[1]
@@ -310,6 +309,12 @@ class EventFilter(ValueFilter):
     """Filter against a cloudwatch event associated to a resource type."""
 
     schema = type_schema('event', rinherit=ValueFilter.schema)
+
+    def validate(self):
+        if 'mode' not in self.manager.data:
+            raise FilterValidationError(
+                "Event filters can only be used with lambda policies")
+        return self
 
     def process(self, resources, event=None):
         if event is None:

@@ -26,11 +26,14 @@ import json
 import logging
 import os
 import sys
+import platform
 import tempfile
 import zipfile
 
 from boto3.s3.transfer import S3Transfer, TransferConfig
 from botocore.exceptions import ClientError
+
+from concurrent.futures import ThreadPoolExecutor
 
 import c7n
 
@@ -82,7 +85,7 @@ class PythonPackageArchive(object):
 
     def create(self):
         assert not self._temp_archive_file, "Archive already created"
-        self._temp_archive_file = tempfile.NamedTemporaryFile()
+        self._temp_archive_file = tempfile.NamedTemporaryFile(delete=False)
         self._zip_file = zipfile.ZipFile(
             self._temp_archive_file, mode='w',
             compression=zipfile.ZIP_DEFLATED)
@@ -141,6 +144,7 @@ class PythonPackageArchive(object):
 
     def remove(self):
         # dispose of the temp file for garbag collection
+        os.remove(self._temp_archive_file.name)
         if self._temp_archive_file:
             self._temp_archive_file = None
 
@@ -169,7 +173,7 @@ def custodian_archive(skip=None):
 
     # Some aggressive shrinking
     required = ["concurrent", "yaml", "pkg_resources"]
-    host_platform = os.uname()[0]
+    host_platform = platform.uname()[0]
 
     def lib_filter(root, dirs, files):
         for f in list(files):
@@ -233,6 +237,33 @@ class LambdaManager(object):
         except ClientError as e:
             if e.response['Error']['Code'] != 'ResourceNotFoundException':
                 raise
+
+    def metrics(self, funcs, start, end, period=5*60):
+
+        def func_metrics(f):
+            metrics = self.session_factory().client('cloudwatch')
+            values = {}
+            for m in ('Errors', 'Invocations', 'Durations', 'Throttles'):
+                values[m] = metrics.get_metric_statistics(
+                    Namespace="AWS/Lambda",
+                    Dimensions=[{
+                        'Name': 'FunctionName',
+                        'Value': (
+                            isinstance(f, dict) and f['FunctionName']
+                            or f.name)}],
+                    Statistics=["Sum"],
+                    StartTime=start,
+                    EndTime=end,
+                    Period=period,
+                    MetricName=m)['Datapoints']
+            return values
+
+        with ThreadPoolExecutor(max_workers=3) as w:
+            results = list(w.map(func_metrics, funcs))
+            for m, f in zip(results, funcs):
+                if isinstance(f, dict):
+                    f['Metrics'] = m
+        return results
 
     def logs(self, func):
         logs = self.session_factory().client('logs')
@@ -796,7 +827,7 @@ class BucketNotification(object):
                 continue
             found = f
         return notifies, found
-    
+
     def add(self, func):
         s3 = self.session.client('s3')
         notifies, found = self._get_notifies(s3, func)
@@ -833,11 +864,11 @@ class BucketNotification(object):
         except ClientError as e:
             if e.response['Error']['Code'] != 'ResourceConflictException':
                 raise
-            
+
         notifies.setdefault('LambdaFunctionConfigurations', []).append(n_params)
         s3.put_bucket_notification_configuration(
             Bucket=self.bucket['Name'], NotificationConfiguration=notifies)
-            
+
         return True
 
     def remove(self, func):

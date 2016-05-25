@@ -132,11 +132,14 @@ def generate(resource_types=()):
             'required': ['name', 'resource'],
             'additionalProperties': False,
             'properties': {
-                'name': {'type': 'string'},
+                'name': {
+                    'type': 'string',
+                    'pattern': "^[A-z][A-z0-9]*(-[A-z0-9]*[A-z][A-z0-9]*)*$"},
                 'resource': {'type': 'string'},
                 'comment': {'type': 'string'},
                 'comments': {'type': 'string'},                
                 'description': {'type': 'string'},
+                'tags': {'type': 'array', 'items': {'type': 'string'}},
                 'mode': {'$ref': '#/definitions/policy-mode'},
                 'actions': {
                     'type': 'array',
@@ -169,9 +172,16 @@ def generate(resource_types=()):
                         'asg-instance-state',
                         'periodic'
                     ]},
-                'events': {'type': 'array', 'items': {'type': 'string'}},
-                'sources': {'type': 'array', 'items': {'type': 'string'}},
-                'ids': {'type': 'string'}
+                'events': {'type': 'array', 'items': {
+                    'oneOf': [
+                        {'type': 'string'},
+                        {'type': 'object',
+                         'required': ['event', 'source', 'ids'],
+                         'properties': {
+                             'source': {'type': 'string'},
+                             'ids': {'type': 'string'},
+                             'event': {'type': 'string'}}}]
+                    }}
             },
         },    
     }
@@ -191,6 +201,7 @@ def generate(resource_types=()):
         'required': ['policies'],
         'additionalProperties': False,
         'properties': {
+            'vars': {'type': 'object'},
             'policies': {
                 'type': 'array',
                 'additionalItems': False,

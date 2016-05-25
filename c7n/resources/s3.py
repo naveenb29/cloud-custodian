@@ -45,6 +45,7 @@ import functools
 import json
 import itertools
 import logging
+import math
 import os
 import time
 
@@ -64,6 +65,9 @@ log = logging.getLogger('custodian.s3')
 
 filters = FilterRegistry('s3.filters')
 actions = ActionRegistry('s3.actions')
+
+
+MAX_COPY_SIZE = 1024 * 1024 * 1024 * 5
 
 
 @resources.register('s3')
@@ -118,10 +122,10 @@ S3_AUGMENT_TABLE = (
     ('get_bucket_replication', 'Replication', None, None),
     ('get_bucket_versioning', 'Versioning', None, None),
     ('get_bucket_website', 'Website', None, None),
-    ('get_bucket_logging', 'Logging', None, 'LoggingEnabled')
+    ('get_bucket_logging', 'Logging', None, 'LoggingEnabled'),
+    ('get_bucket_notification_configuration', 'Notification', None, None)
 #        ('get_bucket_lifecycle', 'Lifecycle', None, None),
 #        ('get_bucket_cors', 'Cors'),
-#        ('get_bucket_notification_configuration', 'Notification')
 )
 
 
@@ -187,7 +191,10 @@ def bucket_client(session, b, kms=False):
 @filters.register('global-grants')
 class GlobalGrantsFilter(Filter):
 
-    schema = type_schema('global-grants')
+    schema = type_schema('global-grants', permissions={
+        'type': 'array', 'items': {
+            'type': 'string', 'enum': [
+                'READ', 'WRITE', 'WRITE_ACP', 'READ', 'READ_ACP']}})
 
     GLOBAL_ALL = "http://acs.amazonaws.com/groups/global/AllUsers"
     AUTH_ALL = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
@@ -203,12 +210,15 @@ class GlobalGrantsFilter(Filter):
         if not acl or not acl['Grants']:
             return
         results = []
+        perms = self.data.get('permissions', [])
         for grant in acl['Grants']:
             if 'URI' not in grant.get("Grantee", {}):
                 continue
-            if grant['Grantee']['URI'] in [self.AUTH_ALL, self.GLOBAL_ALL]:
-                if grant['Permission'] == 'READ' and b['Website']:
-                    continue
+            if grant['Grantee']['URI'] not in [self.AUTH_ALL, self.GLOBAL_ALL]:
+                continue
+            if grant['Permission'] == 'READ' and b['Website']:
+                continue
+            if not perms or (perms and grant['Permission'] in perms):
                 results.append(grant['Permission'])
 
         c = bucket_client(self.manager.session_factory(), b)
@@ -224,6 +234,31 @@ class BucketActionBase(BaseAction):
         return self.permissions
 
 
+@filters.register('has-statement')
+class HasStatementFilter(Filter):
+    """Find buckets with set of named policy statements."""
+    schema = type_schema(
+        'has-statement',
+        statement_ids={'type': 'array', 'items': {'type': 'string'}})
+
+    def process(self, buckets, event=None):
+        return filter(None, map(self.process_bucket, buckets))
+
+    def process_bucket(self, b):
+        p = b['Policy']
+        if p is None:
+            return b
+        p = json.loads(p['Policy'])
+        required = list(self.data.get('statement_ids', []))
+        statements = p.get('Statement', [])
+        for s in list(statements):
+            if s.get('StatementId') in required:
+                required.remove(s['StatementId'])
+        if not required:
+            return b
+        return None
+
+
 @filters.register('missing-statement')
 @filters.register('missing-policy-statement')
 class MissingPolicyStatementFilter(Filter):
@@ -231,14 +266,13 @@ class MissingPolicyStatementFilter(Filter):
 
     schema = type_schema(
         'missing-policy-statement',
-        aliases=('missing-statement'),
+        aliases=('missing-statement',),
         statement_ids={'type': 'array', 'items': {'type': 'string'}})
 
     def process(self, buckets, event=None):
-        with self.executor_factory(max_workers=5) as w:
-            return filter(None, w.map(self.process_bucket, buckets))
+        return filter(None, map(self, buckets))
 
-    def process_bucket(self, b):
+    def __call__(self, b):
         p = b['Policy']
         if p is None:
             return b
@@ -252,8 +286,8 @@ class MissingPolicyStatementFilter(Filter):
             if s.get('StatementId') in required:
                 required.remove(s['StatementId'])
         if not required:
-            return None
-        return b
+            return False
+        return True
 
 
 @actions.register('no-op')
@@ -536,12 +570,12 @@ class ScanBucket(BucketActionBase):
     def _process_bucket(self, b, p, key_log, w):
         content_key = self.get_bucket_op(b, 'contents_key')
         count = 0
+
         for key_set in p:
             count += len(key_set.get(content_key, []))
 
             # Empty bucket check
-            if not content_key in key_set and not key_set['IsTruncated']:
-                # annotate bucket
+            if content_key not in key_set and not key_set['IsTruncated']:
                 b['KeyScanCount'] = count
                 b['KeyRemediated'] = key_log.count
                 return {'Bucket': b['Name'],
@@ -570,7 +604,10 @@ class ScanBucket(BucketActionBase):
                 log.info('Scan Complete bucket:%s keys:%d remediated:%d',
                          b['Name'], count, key_log.count)
 
-        return {'Bucket': b['Name'], 'Remediated': key_log.count, 'Count': count}
+        b['KeyScanCount'] = count
+        b['KeyRemediated'] = key_log.count
+        return {
+            'Bucket': b['Name'], 'Remediated': key_log.count, 'Count': count}
 
     def process_chunk(self, batch, bucket):
         raise NotImplementedError()
@@ -598,6 +635,7 @@ class EncryptExtantKeys(ScanBucket):
         'properties': {
             'report-only': {'type': 'boolean'},
             'glacier': {'type': 'boolean'},
+            'large': {'type': 'boolean'},
             'crypto': {'enum': ['AES256', 'aws:kms']}
             }
         }
@@ -649,7 +687,6 @@ class EncryptExtantKeys(ScanBucket):
 
     def process_key(self, s3, key, bucket_name, info=None):
         k = key['Key']
-
         if info is None:
             info = s3.head_object(Bucket=bucket_name, Key=k)
 
@@ -684,6 +721,10 @@ class EncryptExtantKeys(ScanBucket):
                   'MetadataDirective': 'COPY',
                   'StorageClass': storage_class,
                   'ServerSideEncryption': crypto_method}
+
+        if key['Size'] > MAX_COPY_SIZE and self.data.get('large', True):
+            return self.process_large_file(s3, bucket_name, key, info, params)
+
         s3.copy_object(**params)
         return k
 
@@ -710,6 +751,50 @@ class EncryptExtantKeys(ScanBucket):
             VersionId=key['VersionId'])
         return key['Key'], key['VersionId']
 
+    def process_large_file(self, s3, bucket_name, key, info, params):
+        """For objects over 5gb, use multipart upload to copy"""
+        part_size = MAX_COPY_SIZE - (1024 ** 2)
+        num_parts = int(math.ceil(key['Size'] / part_size))
+        source = params.pop('CopySource')
+
+        params.pop('MetadataDirective')
+        if 'Metadata' in info:
+            params['Metadata'] = info['Metadata']
+
+        upload_id = s3.create_multipart_upload(**params)['UploadId']
+
+        params = {'Bucket': bucket_name,
+                  'Key': key['Key'],
+                  'CopySource': "/%s/%s" % (bucket_name, key['Key']),
+                  'UploadId': upload_id,
+                  'CopySource': source,
+                  'CopySourceIfMatch': key['ETag']}
+
+        def upload_part(part_num):
+            part_params = dict(params)
+            part_params['CopySourceRange'] = "bytes=%d-%d" % (
+                part_size * (part_num - 1),
+                min(part_size * part_num - 1, key['Size'] - 1))
+            part_params['PartNumber'] = part_num
+            response = s3.upload_part_copy(**part_params)
+            return {'ETag': response['CopyPartResult']['ETag'],
+                    'PartNumber': part_num}
+
+        try:
+            with self.executor_factory(max_workers=2) as w:
+                parts = list(w.map(upload_part, range(1, num_parts+1)))
+        except Exception:
+            log.warning(
+                "Error during large key copy bucket: %s key: %s, "
+                "aborting upload", bucket_name, key, exc_info=True)
+            s3.abort_multipart_upload(
+                Bucket=bucket_name, Key=key['Key'], UploadId=upload_id)
+            raise
+        s3.complete_multipart_upload(
+            Bucket=bucket_name, Key=key['Key'], UploadId=upload_id,
+            MultipartUpload={'Parts': parts})
+        return key['Key']
+
 
 def restore_complete(restore):
     if ',' in restore:
@@ -733,7 +818,7 @@ class LogTarget(Filter):
       - cloudtrail
     """
 
-    schema = type_schema('is-log-target')
+    schema = type_schema('is-log-target', value={'type': 'boolean'})
     executor_factory = executor.MainThreadExecutor
 
     def process(self, buckets, event=None):
@@ -755,7 +840,10 @@ class LogTarget(Filter):
 
         self.log.info("Found %d log targets for %d buckets" % (
             len(log_buckets), len(buckets)))
-        return [b for b in buckets if b['Name'] in log_buckets]
+        if self.data.get('value', True):
+            return [b for b in buckets if b['Name'] in log_buckets]
+        else:
+            return [b for b in buckets if b['Name'] not in log_buckets]
 
     @staticmethod
     def get_s3_bucket_locations(buckets):
@@ -773,7 +861,7 @@ class LogTarget(Filter):
         names = set([b['Name'] for b in buckets])
         for t in client.describe_trails().get('trailList', ()):
             if t.get('S3BucketName') in names:
-                yield (t['S3BucketName'], t['S3KeyPrefix'])
+                yield (t['S3BucketName'], t.get('S3KeyPrefix', ''))
 
     def get_elb_bucket_locations(self):
         session = local_session(self.manager.session_factory)
@@ -792,6 +880,9 @@ class LogTarget(Filter):
             results = p.paginate()
             elbs = results.build_full_result().get(
                 'LoadBalancerDescriptions', ())
+            self.log.info("Queried %d elbs", len(elbs))
+        else:
+            self.log.info("Using %d cached elbs", len(elbs))
 
         get_elb_attrs = functools.partial(
             _query_elb_attrs, self.manager.session_factory)
@@ -816,10 +907,11 @@ def _query_elb_attrs(session_factory, elb_set):
     for e in elb_set:
         try:
             attrs = client.describe_load_balancer_attributes(
-                LoadBalancerName=e['LoadBalancerName'])
+                LoadBalancerName=e['LoadBalancerName'])[
+                    'LoadBalancerAttributes']
             if 'AccessLog' in attrs and attrs['AccessLog']['Enabled']:
                 log_targets.append((
-                    attrs['AccessLog']['BucketName'],
+                    attrs['AccessLog']['S3BucketName'],
                     attrs['AccessLog']['S3BucketPrefix']))
         except Exception as err:
             log.warning(
