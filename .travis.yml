@@ -1,17 +1,19 @@
 language: python
+sudo: false
+cache: pip
 env:
   # Region required, and Bypass credential lookup
-  - AWS_DEFAULT_REGION="us-east-1" AWS_ACCESS_KEY_ID="some" AWS_SECRET_ACCESS_KEY="thing"
+  - AWS_DEFAULT_REGION="us-east-1" AWS_ACCESS_KEY_ID="some" AWS_SECRET_ACCESS_KEY="thing" C7N_VALIDATE=yes
 python:
   - "2.7"
-  - "pypy"
 install:
   - pip install -r requirements-dev.txt
-  - pip install coveralls
+  - pip install --upgrade pytest pytest-xdist pytest-cov
+  - pip install --upgrade coveralls
   - python setup.py develop
-script: nosetests -s -v --with-coverage --cover-package=c7n tests
+script:
+  - flake8
+  - make sphinx
+  - py.test -v -n auto --cov=c7n tests tools/c7n_*
 after_success:
   coveralls
-
-
-

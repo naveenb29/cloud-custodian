@@ -11,8 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import mock
+from json import dumps
 from jsonschema.exceptions import best_match
 
+from c7n.manager import resources
 from c7n.schema import Validator, validate, generate, specific_error
 from common import BaseTest
 
@@ -30,6 +33,17 @@ class SchemaTest(BaseTest):
         if not self.validator:
             self.validator = Validator(generate())
 
+    def test_schema_plugin_name_mismatch(self):
+        for k, v in resources.items():
+            for fname, f in v.filter_registry.items():
+                if fname in ('or', 'and', 'not'):
+                    continue
+                self.assertIn(
+                    fname, f.schema['properties']['type']['enum'])
+            for aname, a in v.action_registry.items():
+                self.assertIn(
+                    aname, a.schema['properties']['type']['enum'])
+
     def test_schema(self):
         try:
             schema = generate()
@@ -37,8 +51,28 @@ class SchemaTest(BaseTest):
         except Exception:
             self.fail("Invalid schema")
 
+    def test_schema_serialization(self):
+        try:
+            dumps(generate())
+        except:
+            self.fail("Failed to serialize schema")
+
     def test_empty_skeleton(self):
         self.assertEqual(validate({'policies': []}), [])
+
+    def test_duplicate_policies(self):
+        data = {
+            'policies': [
+                {'name': 'monday-morning',
+                 'resource': 'ec2'},
+                {'name': 'monday-morning',
+                 'resource': 'ec2'},
+                ]}
+
+        result = validate(data)
+        self.assertEqual(len(result), 1)
+        self.assertTrue(isinstance(result[0], ValueError))
+        self.assertTrue('monday-morning' in str(result[0]))
 
     def test_semantic_error(self):
         data = {
@@ -61,6 +95,25 @@ class SchemaTest(BaseTest):
             "'skipped_devices': []" in error.message)
         self.assertTrue(
             "'type': 'ebs'" in error.message)
+
+    @mock.patch('c7n.schema.specific_error')
+    def test_handle_specific_error_fail(self, mock_specific_error):
+        from jsonschema.exceptions import ValidationError
+        data = {
+                'policies': [{'name': 'test',
+                 'resource': 'ec2',
+                 'filters': {
+                     'type': 'ebs',
+                     'invalid': []}
+                    }]
+            }
+        mock_specific_error.side_effect = ValueError('The specific error crapped out hard')
+        resp = validate(data)
+        # if it is 2, then we know we got the exception from specific_error
+        self.assertEqual(len(resp), 2)
+        self.assertIsInstance(resp[0], ValidationError)
+        self.assertIsInstance(resp[1], ValidationError)
+
 
     def test_vars_and_tags(self):
         data = {
@@ -186,9 +239,9 @@ class SchemaTest(BaseTest):
                  'filters': [
                      {'tag:aws:autoscaling:groupName': 'absent'},
                      {'type': 'offhour',
-                      'tag': 'maid_downtime',
+                      'tag': 'c7n_downtime',
                       'default_tz': 'et',
-                      'hour': 19}]
+                      'offhour': 19}]
                  }]
             }
         schema = generate(['ec2'])

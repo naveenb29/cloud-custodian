@@ -19,29 +19,32 @@ from botocore.session import get_session
 from boto3 import Session
 
 from c7n.version import version
+from c7n.utils import get_retry
 
 
 class SessionFactory(object):
-    
+
     def __init__(self, region, profile=None, assume_role=None):
         self.region = region
         self.profile = profile
         self.assume_role = assume_role
 
     def __call__(self, assume=True, region=None):
-        session = Session(
-            region_name=region or self.region,
-            profile_name=self.profile)
         if self.assume_role and assume:
+            session = Session(profile_name=self.profile)
             session = assumed_session(
-                self.assume_role, "CloudCustodian", session)
+                self.assume_role, "CloudCustodian", session,
+                region or self.region)
+        else:
+            session = Session(
+                region_name=region or self.region, profile_name=self.profile)
 
         session._session.user_agent_name = "CloudCustodian"
         session._session.user_agent_version = version
         return session
 
-    
-def assumed_session(role_arn, session_name, session=None):
+
+def assumed_session(role_arn, session_name, session=None, region=None):
     """STS Role assume a boto3.Session
 
     With automatic credential renewal.
@@ -59,8 +62,11 @@ def assumed_session(role_arn, session_name, session=None):
     if session is None:
         session = Session()
 
+    retry = get_retry(('Throttling',))
+
     def refresh():
-        credentials = session.client('sts').assume_role(
+        credentials = retry(
+            session.client('sts').assume_role,
             RoleArn=role_arn,
             RoleSessionName=session_name)['Credentials']
         return dict(
@@ -80,9 +86,10 @@ def assumed_session(role_arn, session_name, session=None):
     # but its pretty baroque as well with upstream support.
     # https://github.com/boto/boto3/issues/443
     # https://github.com/boto/botocore/issues/761
-    
+
     s = get_session()
     s._credentials = session_credentials
-    region = s.get_config_variable('region') or 'us-east-1'
+    if region is None:
+        region = s.get_config_variable('region') or 'us-east-1'
     s.set_config_variable('region', region)
     return Session(botocore_session=s)

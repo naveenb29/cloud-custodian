@@ -19,7 +19,7 @@ import unittest
 from c7n import filters as base_filters
 from c7n.resources.ec2 import filters
 from c7n.utils import annotation
-from .common import instance, event_data, Bag
+from common import instance, event_data, Bag
 
 
 class BaseFilterTest(unittest.TestCase):
@@ -50,6 +50,10 @@ class TestFilter(unittest.TestCase):
             base_filters.FilterValidationError,
             filters.factory, {'type': 'ax', 'xyz': 1})
 
+    def test_filter_call(self):
+        filter_instance = base_filters.Filter({})
+        self.assertIsInstance(filter_instance, base_filters.Filter)
+
 
 class TestOrFilter(unittest.TestCase):
 
@@ -58,12 +62,13 @@ class TestOrFilter(unittest.TestCase):
             'or': [
                 {'Architecture': 'x86_64'},
                 {'Architecture': 'armv8'}]})
+        results = [instance(Architecture='x86_64')]
         self.assertEqual(
-            f(instance(Architecture='x86_64')),
-            True)
+            f.process(results),
+            results)
         self.assertEqual(
-            f(instance(Architecture='amd64')),
-            False)
+            f.process([instance(Architecture='amd64')]),
+            [])
 
 
 class TestAndFilter(unittest.TestCase):
@@ -73,20 +78,101 @@ class TestAndFilter(unittest.TestCase):
             'and': [
                 {'Architecture': 'x86_64'},
                 {'Color': 'green'}]})
+        results = [instance(Architecture='x86_64', Color='green')]
         self.assertEqual(
-            f(instance(
-                Architecture='x86_64',
-                Color='green')),
-            True)
+            f.process(results),
+            results)
         self.assertEqual(
-            f(instance(
-                Architecture='x86_64',
-                Color='blue')),
-            False)
+            f.process([
+                instance(
+                    Architecture='x86_64',
+                    Color='blue')]),
+            [])
         self.assertEqual(
-            f(instance(
-                Architecture='x86_64')),
-            False)
+            f.process([
+                instance(
+                    Architecture='x86_64')]),
+            [])
+
+
+class TestNotFilter(unittest.TestCase):
+    
+    def test_not(self):
+
+        results = [
+            instance(Architecture='x86_64', Color='green'),
+            instance(Architecture='x86_64', Color='blue'),
+            instance(Architecture='x86_64', Color='yellow'),
+        ]
+
+        f = filters.factory({
+            'not': [
+                {'Architecture': 'x86_64'},
+                {'Color': 'green'}]})
+        self.assertEqual(len(f.process(results)), 2)
+        
+        """
+        f = filters.factory({
+            'not': [
+                {'Architecture': 'x86'}]})
+        self.assertEqual(len(f.process(results)), 3)
+
+        f = filters.factory({
+            'not': [
+                {'Architecture': 'x86_64'},
+                {'or': [
+                    {'Color': 'green'},
+                    {'Color': 'blue'},
+                    {'Color': 'yellow'},
+                ]}]})
+        self.assertEqual(len(f.process(results)), 0)
+        """
+
+class TestValueFilter(unittest.TestCase):
+
+    # TODO test_manager needs a valid session_factory object
+    # def test_value_match(self):
+    #     test_manager = ???
+    #     f_data = {
+    #         'type': 'value',
+    #         'key': 'day',
+    #         'value': 5,
+    #         'value_from': {
+    #             'url': 's3://custodian-byebye/resource.json',
+    #         },
+    #     }
+    #     vf = filters.factory(f_data, test_manager)
+    #     vf.match({'tag:ASV': 'present'})
+
+    def test_value_type(self):
+        sentinel = datetime.now()
+        value = 5
+        vf = filters.factory({'tag:ASV': 'absent'})
+        vf.vtype = 'size'
+        res = vf.process_value_type(sentinel, value)
+        self.assertEqual(res, (sentinel, 0))
+        vf.vtype = 'age'
+        res = vf.process_value_type(sentinel, value)
+        self.assertEqual(res, (0, sentinel))
+        vf.vtype = 'cidr'
+        sentinel = '10.0.0.0/16'
+        value = '10.10.10.10'
+        res = vf.process_value_type(sentinel, value)
+        self.assertEqual(
+            (str(res[0]), str(res[1])),
+            (sentinel, value),
+        )
+        vf.vtype = 'cidr_size'
+        value = '10.10.10.300'
+        res = vf.process_value_type(sentinel, value)
+        self.assertEqual(res, (sentinel, 0))
+
+
+class TestAgeFilter(unittest.TestCase):
+
+    def test_age_filter(self):
+        af = base_filters.AgeFilter({})
+        self.assertRaises(NotImplementedError, af.validate)
 
 
 class TestGlobValue(unittest.TestCase):
@@ -107,6 +193,10 @@ class TestGlobValue(unittest.TestCase):
                 Architecture='x86_64',
                 Color='blue')),
             False)
+
+    def test_glob_match(self):
+        glob_match = base_filters.core.glob_match
+        self.assertFalse(glob_match(0, ''))
 
 
 class TestRegexValue(unittest.TestCase):
@@ -143,6 +233,145 @@ class TestRegexValue(unittest.TestCase):
             False)
 
 
+class TestValueTypes(BaseFilterTest):
+
+    def test_normalize(self):
+        fdata = {
+            'type': 'value',
+            'key': 'tag:Name',
+            'value_type': 'normalize',
+            'value': 'compilelambda'
+        }
+        self.assertFilter(fdata, instance(), True)
+
+    def test_size(self):
+        fdata = {
+            'type': 'value',
+            'key': 'SecurityGroups[].GroupId',
+            'value_type': 'size',
+            'value': 2
+        }
+        self.assertFilter(fdata, instance(), True)
+
+    def test_integer(self):
+        fdata = {
+            'type': 'value',
+            'key': 'tag:Count',
+            'op': 'greater-than',
+            'value_type': 'integer',
+            'value': 0}
+
+        def i(d):
+            return instance(Tags=[{"Key": "Count", "Value": d}])
+
+        self.assertFilter(fdata, i('42'), True)
+        self.assertFilter(fdata, i('abc'), False)
+
+        fdata['op'] = 'equal'
+        self.assertFilter(fdata, i('abc'), True)
+
+    def test_swap(self):
+        fdata = {
+            'type': 'value',
+            'key': 'SecurityGroups[].GroupId',
+            'value_type': 'swap',
+            'op': 'in',
+            'value': 'sg-47b76f22'
+        }
+        self.assertFilter(fdata, instance(), True)
+
+    def test_age(self):
+        now = datetime.now(tz=tz.tzutc())
+        three_months = now - timedelta(90)
+        two_months = now - timedelta(60)
+        one_month = now - timedelta(30)
+
+        def i(d):
+            return instance(LaunchTime=d)
+
+        fdata = {
+            'type': 'value',
+            'key': 'LaunchTime',
+            'op': 'less-than',
+            'value_type': 'age',
+            'value': 32}
+
+        self.assertFilter(fdata, i(three_months), False)
+        self.assertFilter(fdata, i(two_months), False)
+        self.assertFilter(fdata, i(one_month), True)
+        self.assertFilter(fdata, i(now), True)
+        self.assertFilter(fdata, i(now.isoformat()), True)
+
+    def test_expiration(self):
+
+        now = datetime.now(tz=tz.tzutc())
+        three_months = now + timedelta(90)
+        two_months = now + timedelta(60)
+
+        def i(d):
+            return instance(LaunchTime=d)
+
+        fdata = {
+            'type': 'value',
+            'key': 'LaunchTime',
+            'op': 'less-than',
+            'value_type': 'expiration',
+            'value': 61}
+
+        self.assertFilter(fdata, i(three_months), False)
+        self.assertFilter(fdata, i(two_months), True)
+        self.assertFilter(fdata, i(now), True)
+        self.assertFilter(fdata, i(now.isoformat()), True)
+
+    def test_resource_count_filter(self):
+        fdata = {
+            'type': 'value',
+            'value_type': 'resource_count',
+            'op': 'lt',
+            'value': 2
+        }
+        self.assertFilter(fdata, instance(file='ec2-instances.json'), [])
+
+        f = filters.factory({
+            'type': 'value',
+            'value_type': 'resource_count',
+            'op': 'eq',
+            'value': 2
+        })
+        i = instance(file='ec2-instances.json')
+        self.assertEqual(i, f(i))
+
+    def test_resource_count_filter_validation(self):
+        # Bad `op`
+        f = {
+            'type': 'value',
+            'value_type': 'resource_count',
+            'op': 'regex',
+            'value': 1,
+        }
+        self.assertRaises(
+            base_filters.FilterValidationError, filters.factory, f, {})
+
+        # Bad `value`
+        f = {
+            'type': 'value',
+            'value_type': 'resource_count',
+            'op': 'eq',
+            'value': 'foo',
+        }
+        self.assertRaises(
+            base_filters.FilterValidationError, filters.factory, f, {})
+
+        # Missing `op`
+        f = {
+            'type': 'value',
+            'value_type': 'resource_count',
+            'value': 1,
+        }
+        self.assertRaises(
+            base_filters.FilterValidationError, filters.factory, f, {})
+
+
 class TestInstanceAge(BaseFilterTest):
 
     def test_filter_instance_age(self):
@@ -160,8 +389,22 @@ class TestInstanceAge(BaseFilterTest):
                 (i(two_months), True),
                 (i(one_month), False)
         ]:
-            self.assertFilter({'type': 'instance-uptime'}, ii, v)
+            self.assertFilter({'type': 'instance-uptime', 'op': 'gte', 'days': 60}, ii, v)
 
+class TestInstanceAgeMinute(BaseFilterTest):
+
+    def test_filter_instance_age(self):
+        now = datetime.now(tz=tz.tzutc())
+        five_minute = now - timedelta(minutes=5)
+
+        def i(d):
+            return instance(LaunchTime=d)
+
+        for ii, v in [
+                (i(now), False),
+                (i(five_minute), True)
+        ]:
+            self.assertFilter({'type': 'instance-uptime', 'op': 'gte', 'minutes': 5}, ii, v)
 
 class TestMarkedForAction(BaseFilterTest):
 
@@ -200,7 +443,6 @@ class TestMarkedForAction(BaseFilterTest):
                  "Value": "not compliant: %s@%s" % (
                     action, d.strftime("%Y/%m/%d"))}])
 
-
         for ii, v in [
                 (i(yesterday), True),
                 (i(now), True),
@@ -218,8 +460,13 @@ class EventFilterTest(BaseFilterTest):
         f = {'type': 'event',
              'key': 'detail.state',
              'value': 'pending'}
-        self.assertTrue(filters.factory(f, b).process(
+        ef = filters.factory(f, b)
+        self.assertTrue(ef.process(
             [instance()], event))
+        # event is None
+        self.assertEqual(ef.process('resources'), 'resources')
+        # event is not None, but is not "true" either
+        self.assertEqual(ef.process('resources', []), [])
 
     def test_event_no_mode(self):
         b = Bag(data={'resource': 'something'})
@@ -259,6 +506,15 @@ class TestInstanceValue(BaseFilterTest):
         self.assertEqual(
             annotation(i, base_filters.ANNOTATION_KEY), ['tag:ASV'])
 
+    def test_present(self):
+        i = instance(Tags=[
+            {'Key': 'ASV', 'Value': ''}])
+        self.assertFilter(
+            {'type': 'value',
+             'key': 'tag:ASV',
+             'value': 'present'},
+            i, True)
+
     def test_jmespath(self):
         self.assertFilter(
             {'Placement.AvailabilityZone': 'us-west-2c'},
@@ -291,7 +547,10 @@ class TestInstanceValue(BaseFilterTest):
 
     def test_complex_value_filter(self):
         self.assertFilter(
-            {"key": "length(BlockDeviceMappings[?Ebs.DeleteOnTermination == `true`].Ebs.DeleteOnTermination)",
+            {"key": (
+                "length(BlockDeviceMappings"
+                "[?Ebs.DeleteOnTermination == `true`]"
+                ".Ebs.DeleteOnTermination)"),
              "value": 0,
              "type": "value",
              "op": "gt"},
@@ -478,6 +737,17 @@ class TestNotInList(unittest.TestCase):
         self.assertEqual(
             f(instance(Thing='Foo')),
             False)
+
+
+class TestFilterRegistry(unittest.TestCase):
+
+    def test_filter_registry(self):
+        reg = base_filters.FilterRegistry('test.filters')
+        self.assertRaises(
+            base_filters.FilterValidationError,
+            reg.factory,
+            {'type': ''},
+        )
 
 
 if __name__ == '__main__':

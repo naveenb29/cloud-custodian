@@ -1,0 +1,24 @@
+{
+    "status_code": 200, 
+    "data": {
+        "Subnet": {
+            "VpcId": "vpc-885c83ee", 
+            "CidrBlock": "10.4.8.0/24", 
+            "State": "pending", 
+            "AvailabilityZone": "us-east-1e", 
+            "SubnetId": "subnet-ed02abd1", 
+            "AvailableIpAddressCount": 251
+        }, 
+        "ResponseMetadata": {
+            "HTTPStatusCode": 200, 
+            "RequestId": "77314c72-a78c-43a9-854e-af7ba429fda6", 
+            "HTTPHeaders": {
+                "transfer-encoding": "chunked", 
+                "vary": "Accept-Encoding", 
+                "server": "AmazonEC2", 
+                "content-type": "text/xml;charset=UTF-8", 
+                "date": "Fri, 16 Dec 2016 22:06:08 GMT"
+            }
+        }
+    }
+}

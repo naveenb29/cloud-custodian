@@ -16,7 +16,7 @@
 class PluginRegistry(object):
     """A plugin registry
 
-    Maid is intended to be innately pluggable both internally and
+    Custodian is intended to be innately pluggable both internally and
     externally, for resource types and their filters and actions.
 
     This plugin registry abstraction provides the core mechanism for
@@ -43,6 +43,7 @@ class PluginRegistry(object):
       PluginRegistry('ec2.filters').load_plugins()
 
     """
+
     def __init__(self, plugin_type):
         self.plugin_type = plugin_type
         self._factories = {}
@@ -50,12 +51,14 @@ class PluginRegistry(object):
     def register(self, name, klass=None):
         # invoked as function
         if klass:
+            klass.type = name
             self._factories[name] = klass
             return klass
 
         # invoked as class decorator
         def _register_class(klass):
             self._factories[name] = klass
+            klass.type = name
             return klass
         return _register_class
 
@@ -75,12 +78,13 @@ class PluginRegistry(object):
     def load_plugins(self):
         """ Load external plugins.
 
-        Maid is intended to interact with internal and external systems
+        Custodian is intended to interact with internal and external systems
         that are not suitable for embedding into the custodian code base.
         """
-        from pkg_resources import iter_entry_points
+        try:
+            from pkg_resources import iter_entry_points
+        except ImportError:
+            return
         for ep in iter_entry_points(group="custodian.%s" % self.plugin_type):
             f = ep.load()
             f()
-
-

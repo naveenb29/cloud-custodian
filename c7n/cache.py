@@ -21,7 +21,7 @@ import os
 import logging
 import time
 
-log = logging.getLogger('c7n.cache')
+log = logging.getLogger('custodian.cache')
 
 
 def factory(config):
@@ -29,7 +29,7 @@ def factory(config):
         return NullCache(None)
 
     if not config.cache or not config.cache_period:
-        log.info("Disabling cache")
+        log.debug("Disabling cache")
         return NullCache(config)
 
     return FileCacheManager(config)

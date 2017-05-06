@@ -1,0 +1,45 @@
+{
+    "status_code": 200, 
+    "data": {
+        "ResponseMetadata": {
+            "HTTPStatusCode": 200, 
+            "RequestId": "7c81b6c2-eda9-46a6-b7f7-6b5ad22f6b75", 
+            "HTTPHeaders": {
+                "transfer-encoding": "chunked", 
+                "vary": "Accept-Encoding", 
+                "server": "AmazonEC2", 
+                "content-type": "text/xml;charset=UTF-8", 
+                "date": "Fri, 16 Dec 2016 22:06:12 GMT"
+            }
+        }, 
+        "NetworkInterfaces": [
+            {
+                "Status": "available", 
+                "MacAddress": "06:06:48:36:49:e8", 
+                "SourceDestCheck": true, 
+                "VpcId": "vpc-885c83ee", 
+                "Description": "", 
+                "NetworkInterfaceId": "eni-3439c3dc", 
+                "PrivateIpAddresses": [
+                    {
+                        "Primary": true, 
+                        "PrivateIpAddress": "10.4.8.223"
+                    }
+                ], 
+                "RequesterManaged": false, 
+                "Groups": [
+                    {
+                        "GroupName": "quarantine-group", 
+                        "GroupId": "sg-6d4b6010"
+                    }
+                ], 
+                "AvailabilityZone": "us-east-1e", 
+                "RequesterId": "AIDAINLXB4P6J26AKFUC6", 
+                "SubnetId": "subnet-ed02abd1", 
+                "OwnerId": "644160558196", 
+                "TagSet": [], 
+                "PrivateIpAddress": "10.4.8.223"
+            }
+        ]
+    }
+}

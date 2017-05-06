@@ -26,10 +26,8 @@ class ResourceManager(object):
 
     filter_registry = None
     action_registry = None
-
-    supports_dry_run = False
-
     executor_factory = ThreadPoolExecutor
+    retry = None
 
     def __init__(self, ctx, data):
         self.ctx = ctx
@@ -51,21 +49,49 @@ class ResourceManager(object):
     def format_json(self, resources, fh):
         return dumps(resources, fh, indent=2)
 
-    def resource_query(self):
-        """Return server side query filter for the given api."""
-        return []
+    def match_ids(self, ids):
+        """return ids that match this resource type's id format."""
+        return ids
+
+    @classmethod
+    def get_permissions(cls):
+        return ()
 
     def get_resources(self, resource_ids):
+        """Retrieve a set of resources by id."""
         return []
+
+    def resources(self):
+        raise NotImplementedError("")
+
+    def get_resource_manager(self, resource_type, data=None):
+        klass = resources.get(resource_type)
+        if klass is None:
+            raise ValueError(resource_type)
+        # if we're already querying via config carry it forward
+        if not data and self.source_type == 'config' and getattr(
+                klass.get_model(), 'config_type', None):
+            return klass(self.ctx, {'source': self.config_type})
+        return klass(self.ctx, data or {})
 
     def filter_resources(self, resources, event=None):
         original = len(resources)
+        if event and event.get('debug', False):
+            self.log.info(
+                "Filtering resources with %s", self.filters)
         for f in self.filters:
-            if event and event['debug']:
-                self.log.info("applying filter %s", f)
-            resources = f.process(resources, event)
             if not resources:
                 break
-        self.log.info("Filtered from %d to %d %s" % (
+            rcount = len(resources)
+            resources = f.process(resources, event)
+            if event and event.get('debug', False):
+                self.log.debug(
+                    "applied filter %s %d->%d", f, rcount, len(resources))
+        self.log.debug("Filtered from %d to %d %s" % (
             original, len(resources), self.__class__.__name__.lower()))
         return resources
+
+    def get_model(self):
+        """Returns the resource meta-model.
+        """
+        return self.query.resolve(self.resource_type)

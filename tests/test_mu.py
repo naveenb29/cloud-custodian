@@ -12,15 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from datetime import datetime, timedelta
+import imp
 import json
 import logging
+import os
+import platform
+import py_compile
+import shutil
+import sys
+import tempfile
+import time
 import unittest
-import StringIO
 import zipfile
 
-from c7n.mu import custodian_archive, LambdaManager, PolicyLambda
+from c7n.mu import (
+    custodian_archive, LambdaManager, PolicyLambda, PythonPackageArchive,
+    CloudWatchLogSubscription, SNSSubscription, RUNTIME)
 from c7n.policy import Policy
-from .common import BaseTest, Config
+from c7n.ufuncs import logsub
+from common import BaseTest, Config, event_data
+from data import helloworld
 
 
 class PolicyLambdaProvision(BaseTest):
@@ -31,7 +42,107 @@ class PolicyLambdaProvision(BaseTest):
         for k, v in expected.items():
             self.assertEqual(v, result[k])
 
-    def xtest_cwe_update_no_change(self):
+    def test_config_rule_provision(self):
+        session_factory = self.replay_flight_data('test_config_rule')
+        p = Policy({
+            'resource': 'security-group',
+            'name': 'sg-modified',
+            'mode': {'type': 'config-rule'},
+        }, Config.empty())
+        pl = PolicyLambda(p)
+        mgr = LambdaManager(session_factory)
+        result = mgr.publish(pl, 'Dev', role=self.role)
+        self.assertEqual(result['FunctionName'], 'custodian-sg-modified')
+        self.addCleanup(mgr.remove, pl)
+
+    def test_config_rule_evaluation(self):
+        session_factory = self.replay_flight_data('test_config_rule_evaluate')
+        p = self.load_policy({
+            'resource': 'ec2',
+            'name': 'ec2-modified',
+            'mode': {'type': 'config-rule'},
+            'filters': [{'InstanceId': 'i-094bc87c84d56c589'}]
+            }, session_factory=session_factory)
+        mode = p.get_execution_mode()
+        event = event_data('event-config-rule-instance.json')
+        resources = mode.run(event, None)
+        self.assertEqual(len(resources), 1)
+
+    def test_cwl_subscriber(self):
+        self.patch(CloudWatchLogSubscription, 'iam_delay', 0.01)
+        session_factory = self.replay_flight_data('test_cwl_subscriber')
+        session = session_factory()
+        client = session.client('logs')
+
+        lname = "custodian-test-log-sub"
+        self.addCleanup(client.delete_log_group, logGroupName=lname)
+        client.create_log_group(logGroupName=lname)
+        linfo = client.describe_log_groups(
+            logGroupNamePrefix=lname)['logGroups'][0]
+
+        params = dict(
+            session_factory=session_factory,
+            name="c7n-log-sub",
+            role=self.role,
+            sns_topic="arn:",
+            log_groups=[linfo])
+
+        func = logsub.get_function(**params)
+        manager = LambdaManager(session_factory)
+        finfo = manager.publish(func)
+        self.addCleanup(manager.remove, func)
+
+        results = client.describe_subscription_filters(logGroupName=lname)
+        self.assertEqual(len(results['subscriptionFilters']), 1)
+        self.assertEqual(results['subscriptionFilters'][0]['destinationArn'],
+                         finfo['FunctionArn'])
+        # try and update
+        #params['sns_topic'] = "arn:123"
+        #manager.publish(func)
+
+    def test_sns_subscriber(self):
+        self.patch(SNSSubscription, 'iam_delay', 0.01)
+        session_factory = self.replay_flight_data('test_sns_subscriber')
+        session = session_factory()
+        client = session.client('sns')
+
+        # create an sns topic
+        tname = "custodian-test-sns-sub"
+        topic_arn = client.create_topic(Name=tname)['TopicArn']
+        self.addCleanup(client.delete_topic, TopicArn=topic_arn)
+
+        # provision a lambda via mu
+        params = dict(
+            session_factory=session_factory,
+            name='c7n-hello-world',
+            role='arn:aws:iam::644160558196:role/custodian-mu',
+            events=[SNSSubscription(session_factory, [topic_arn])])
+
+        func = helloworld.get_function(**params)
+        manager = LambdaManager(session_factory)
+        manager.publish(func)
+        self.addCleanup(manager.remove, func)
+
+        # now publish to the topic and look for lambda log output
+        client.publish(TopicArn=topic_arn, Message='Greetings, program!')
+        #time.sleep(15) -- turn this back on when recording flight data
+        log_events = manager.logs(func, '1970-1-1', '9170-1-1')
+        messages = [e['message'] for e in log_events
+                    if e['message'].startswith('{"Records')]
+        self.addCleanup(
+            session.client('logs').delete_log_group,
+            logGroupName='/aws/lambda/c7n-hello-world')
+        self.assertEqual(
+            json.loads(messages[0])['Records'][0]['Sns']['Message'],
+            'Greetings, program!')
+
+    def test_cwe_update_config_and_code(self):
+        # Originally this was testing the no update case.. but
+        # That is tricky to record, any updates to the code end up
+        # causing issues due to checksum mismatches which imply updating
+        # the function code / which invalidate the recorded data and
+        # the focus of the test.
+
         session_factory = self.replay_flight_data(
             'test_cwe_update', zdata=True)
         p = Policy({
@@ -49,11 +160,42 @@ class PolicyLambdaProvision(BaseTest):
         pl = PolicyLambda(p)
         mgr = LambdaManager(session_factory)
         result = mgr.publish(pl, 'Dev', role=self.role)
+        self.addCleanup(mgr.remove, pl)
+
+        p = Policy({
+            'resource': 's3',
+            'name': 's3-bucket-policy',
+            'mode': {
+                'type': 'cloudtrail',
+                'memory': 256,
+                'events': [
+                    "CreateBucket",
+                    {'event': 'PutBucketPolicy',
+                     'ids': 'requestParameters.bucketName',
+                     'source': 's3.amazonaws.com'}]
+            },
+            'filters': [
+                {'type': 'missing-policy-statement',
+                 'statement_ids': ['RequireEncryptedPutObject']}],
+            'actions': ['no-op']
+        }, Config.empty())
+
         output = self.capture_logging('custodian.lambda', level=logging.DEBUG)
         result2 = mgr.publish(PolicyLambda(p), 'Dev', role=self.role)
-        self.assertEqual(len(output.getvalue().strip().split('\n')), 1)
+
+        lines = output.getvalue().strip().split('\n')
+        self.assertTrue(
+            'Updating function custodian-s3-bucket-policy code' in lines)
+        self.assertTrue(
+            'Updating function: custodian-s3-bucket-policy config' in lines)
         self.assertEqual(result['FunctionName'], result2['FunctionName'])
-        mgr.remove(pl)
+        # drive by coverage
+        functions = [i for i in mgr.list_functions()
+                     if i['FunctionName'] == 'custodian-s3-bucket-policy']
+        self.assertTrue(len(functions), 1)
+        start = 0L
+        end = long(time.time() * 1000)
+        self.assertEqual(list(mgr.logs(pl, start, end)), [])
 
     def test_cwe_trail(self):
         session_factory = self.replay_flight_data('test_cwe_trail', zdata=True)
@@ -79,7 +221,7 @@ class PolicyLambdaProvision(BaseTest):
         self.assertEqual(
             json.loads(event.render_event_pattern()),
             {u'detail': {u'eventName': [u'CreateBucket'],
-                         u'eventSource': [u'aws.s3']},
+                         u'eventSource': [u's3.amazonaws.com']},
              u'detail-type': ['AWS API Call via CloudTrail']})
 
         self.assert_items(
@@ -88,7 +230,7 @@ class PolicyLambdaProvision(BaseTest):
              'FunctionName': 'custodian-s3-bucket-policy',
              'Handler': 'custodian_policy.run',
              'MemorySize': 512,
-             'Runtime': 'python2.7',
+             'Runtime': RUNTIME,
              'Timeout': 60})
         mgr.remove(pl)
 
@@ -127,19 +269,19 @@ class PolicyLambdaProvision(BaseTest):
         result = mgr.publish(pl, 'Dev', role=self.role)
         self.assert_items(
             result,
-            {'Description': 'cloud-maid lambda policy',
-             'FunctionName': 'maid-ec2-encrypted-vol',
-             'Handler': 'maid_policy.run',
+            {'Description': 'cloud-custodian lambda policy',
+             'FunctionName': 'c7n-ec2-encrypted-vol',
+             'Handler': 'c7n_policy.run',
              'MemorySize': 512,
-             'Runtime': 'python2.7',
+             'Runtime': RUNTIME,
              'Timeout': 60})
 
         events = session_factory().client('events')
-        result = events.list_rules(NamePrefix="maid-ec2-encrypted-vol")
+        result = events.list_rules(NamePrefix="c7n-ec2-encrypted-vol")
         self.assert_items(
             result['Rules'][0],
             {"State": "ENABLED",
-             "Name": "maid-ec2-encrypted-vol"})
+             "Name": "c7n-ec2-encrypted-vol"})
 
         self.assertEqual(
             json.loads(result['Rules'][0]['EventPattern']),
@@ -163,18 +305,18 @@ class PolicyLambdaProvision(BaseTest):
         result = mgr.publish(pl, 'Dev', role=self.role)
         self.assert_items(
             result,
-            {'FunctionName': 'maid-asg-spin-detector',
-             'Handler': 'maid_policy.run',
+            {'FunctionName': 'c7n-asg-spin-detector',
+             'Handler': 'c7n_policy.run',
              'MemorySize': 512,
-             'Runtime': 'python2.7',
+             'Runtime': RUNTIME,
              'Timeout': 60})
 
         events = session_factory().client('events')
-        result = events.list_rules(NamePrefix="maid-asg-spin-detector")
+        result = events.list_rules(NamePrefix="c7n-asg-spin-detector")
         self.assert_items(
             result['Rules'][0],
             {"State": "ENABLED",
-             "Name": "maid-asg-spin-detector"})
+             "Name": "c7n-asg-spin-detector"})
 
         self.assertEqual(
             json.loads(result['Rules'][0]['EventPattern']),
@@ -199,44 +341,208 @@ class PolicyLambdaProvision(BaseTest):
         result = mgr.publish(pl, 'Dev', role=self.role)
         self.assert_items(
             result,
-            {'FunctionName': 'maid-periodic-ec2-checker',
-             'Handler': 'maid_policy.run',
+            {'FunctionName': 'c7n-periodic-ec2-checker',
+             'Handler': 'c7n_policy.run',
              'MemorySize': 512,
-             'Runtime': 'python2.7',
+             'Runtime': RUNTIME,
              'Timeout': 60})
 
         events = session_factory().client('events')
-        result = events.list_rules(NamePrefix="maid-periodic-ec2-checker")
+        result = events.list_rules(NamePrefix="c7n-periodic-ec2-checker")
         self.assert_items(
             result['Rules'][0],
             {
                 "State": "ENABLED",
                 "ScheduleExpression": "rate(1 day)",
-                "Name": "maid-periodic-ec2-checker"})
+                "Name": "c7n-periodic-ec2-checker"})
         mgr.remove(pl)
 
 
 class PythonArchiveTest(unittest.TestCase):
 
-    def test_archive_bytes(self):
-        self.archive = custodian_archive()
-        self.archive.create()
-        self.addCleanup(self.archive.remove)
-        self.archive.close()
-        io = StringIO.StringIO(self.archive.get_bytes())
-        reader = zipfile.ZipFile(io, mode='r')
-        fileset = [n.filename for n in reader.filelist]
-        self.assertTrue('c7n/__init__.py' in fileset)
+    def make_archive(self, *a, **kw):
+        archive = self.make_open_archive(*a, **kw)
+        archive.close()
+        return archive
 
-    def test_archive_skip(self):
-        self.archive = custodian_archive("*.pyc")
-        self.archive.create()
-        self.addCleanup(self.archive.remove)
-        self.archive.close()
-        with open(self.archive.path) as fh:
+    def make_open_archive(self, *a, **kw):
+        archive = PythonPackageArchive(*a, **kw)
+        self.addCleanup(archive.remove)
+        return archive
+
+    def get_filenames(self, *a, **kw):
+        return self.make_archive(*a, **kw).get_filenames()
+
+
+    def test_handles_stdlib_modules(self):
+        filenames = self.get_filenames('webbrowser')
+        self.assertTrue('webbrowser.py' in filenames)
+
+    def test_handles_third_party_modules(self):
+        filenames = self.get_filenames('ipaddress')
+        self.assertTrue('ipaddress.py' in filenames)
+
+    def test_handles_packages(self):
+        filenames = self.get_filenames('c7n')
+        self.assertTrue('c7n/__init__.py' in filenames)
+        self.assertTrue('c7n/resources/s3.py' in filenames)
+        self.assertTrue('c7n/ufuncs/s3crypt.py' in filenames)
+
+    def test_excludes_non_py_files(self):
+        filenames = self.get_filenames('ctypes')
+        self.assertTrue('ctypes/__init__.py' in filenames)
+        self.assertTrue('ctypes/macholib/__init__.py' in filenames)
+        self.assertTrue('README.ctypes' not in filenames)
+
+    def test_cant_get_bytes_when_open(self):
+        archive = self.make_open_archive()
+        self.assertRaises(AssertionError, archive.get_bytes)
+
+    def test_cant_add_files_when_closed(self):
+        archive = self.make_archive()
+        self.assertRaises(AssertionError, archive.add_file, __file__)
+
+    def test_cant_add_contents_when_closed(self):
+        archive = self.make_archive()
+        self.assertRaises(AssertionError, archive.add_contents, 'foo', 'bar')
+
+    def test_can_add_additional_files_while_open(self):
+        archive = self.make_open_archive()
+        archive.add_file(__file__)
+        archive.close()
+        filenames = archive.get_filenames()
+        self.assertTrue(os.path.basename(__file__) in filenames)
+
+    def test_can_set_path_when_adding_files(self):
+        archive = self.make_open_archive()
+        archive.add_file(__file__, 'cheese/is/yummy.txt')
+        archive.close()
+        filenames = archive.get_filenames()
+        self.assertTrue(os.path.basename(__file__) not in filenames)
+        self.assertTrue('cheese/is/yummy.txt' in filenames)
+
+    def test_can_add_a_file_with_contents_from_a_string(self):
+        archive = self.make_open_archive()
+        archive.add_contents('cheese.txt', 'So yummy!')
+        archive.close()
+        self.assertTrue('cheese.txt' in archive.get_filenames())
+        with archive.get_reader() as reader:
+            self.assertEqual('So yummy!', reader.read('cheese.txt'))
+
+    def test_custodian_archive_creates_a_custodian_archive(self):
+        archive = custodian_archive()
+        self.addCleanup(archive.remove)
+        archive.close()
+        filenames = archive.get_filenames()
+        self.assertTrue('c7n/__init__.py' in filenames)
+        self.assertTrue('pkg_resources/__init__.py' in filenames)
+        self.assertTrue('ipaddress.py' in filenames)
+
+
+    def make_file(self):
+        bench = tempfile.mkdtemp()
+        path = os.path.join(bench, 'foo.txt')
+        open(path, 'w+').write('Foo.')
+        self.addCleanup(lambda: shutil.rmtree(bench))
+        return path
+
+    def check_readable(self, archive):
+        readable = 0o444 << 16L
+        with open(archive.path) as fh:
             reader = zipfile.ZipFile(fh, mode='r')
-            fileset = [n.filename for n in reader.filelist]
-            for i in ['c7n/__init__.pyc',
-                      'c7n/resources/s3.pyc',
-                      'boto3/__init__.py']:
-                self.assertFalse(i in fileset)
+            for i in reader.infolist():
+                self.assertGreaterEqual(i.external_attr, readable)
+
+    def test_files_are_all_readable(self):
+        self.check_readable(self.make_archive('c7n'))
+
+    def test_even_unreadable_files_become_readable(self):
+        path = self.make_file()
+        os.chmod(path, 0o600)
+        archive = self.make_open_archive()
+        archive.add_file(path)
+        archive.close()
+        self.check_readable(archive)
+
+    def test_unless_you_make_your_own_zipinfo(self):
+        info = zipfile.ZipInfo(self.make_file())
+        archive = self.make_open_archive()
+        archive.add_contents(info, 'foo.txt')
+        archive.close()
+        self.assertRaises(AssertionError, self.check_readable, archive)
+
+
+class PycCase(unittest.TestCase):
+
+    def setUp(self):
+        self.bench = tempfile.mkdtemp()
+        sys.path.insert(0, self.bench)
+
+    def tearDown(self):
+        sys.path.remove(self.bench)
+        shutil.rmtree(self.bench)
+
+    def py_with_pyc(self, name):
+        path = os.path.join(self.bench, name)
+        with open(path, 'w+') as fp:
+            fp.write('42')
+        py_compile.compile(path)
+        return path
+
+
+class Constructor(PycCase):
+
+    def test_class_constructor_only_accepts_py_modules_not_pyc(self):
+
+        # Create a module with both *.py and *.pyc.
+        self.py_with_pyc('foo.py')
+
+        # Create another with a *.pyc but no *.py behind it.
+        os.unlink(self.py_with_pyc('bar.py'))
+
+        # Now: *.py takes precedence over *.pyc ...
+        get = lambda name: os.path.basename(imp.find_module(name)[1])
+        self.assertTrue(get('foo'), 'foo.py')
+        try:
+            # ... and while *.pyc is importable ...
+            self.assertTrue(get('bar'), 'bar.pyc')
+        except ImportError:
+            # (except on PyPy)
+            # http://doc.pypy.org/en/latest/config/objspace.lonepycfiles.html
+            self.assertEqual(platform.python_implementation(), 'PyPy')
+        else:
+            # ... we refuse it.
+            with self.assertRaises(ValueError) as raised:
+                PythonPackageArchive('bar')
+            msg = raised.exception.args[0]
+            self.assertTrue(msg.startswith('We need a *.py source file instead'))
+            self.assertTrue(msg.endswith('bar.pyc'))
+
+        # We readily ignore a *.pyc if a *.py exists.
+        archive = PythonPackageArchive('foo')
+        archive.close()
+        self.assertEqual(archive.get_filenames(), ['foo.py'])
+        with archive.get_reader() as reader:
+            self.assertEqual('42', reader.read('foo.py'))
+
+
+class AddPyFile(PycCase):
+
+    def test_can_add_py_file(self):
+        archive = PythonPackageArchive()
+        archive.add_py_file(self.py_with_pyc('foo.py'))
+        archive.close()
+        self.assertEqual(archive.get_filenames(), ['foo.py'])
+
+    def test_reverts_to_py_if_available(self):
+        archive = PythonPackageArchive()
+        py = self.py_with_pyc('foo.py')
+        archive.add_py_file(py+'c')
+        archive.close()
+        self.assertEqual(archive.get_filenames(), ['foo.py'])
+
+    def test_fails_if_py_not_available(self):
+        archive = PythonPackageArchive()
+        py = self.py_with_pyc('foo.py')
+        os.unlink(py)
+        self.assertRaises(IOError, archive.add_py_file, py+'c')

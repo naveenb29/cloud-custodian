@@ -16,7 +16,58 @@ import boto3
 from common import BaseTest
 
 
+class LaunchConfigTest(BaseTest):
+
+    def test_config_unused(self):
+        factory = self.replay_flight_data('test_launch_config_unused')
+        p = self.load_policy({
+            'name': 'unused-cfg',
+            'resource': 'launch-config',
+            'filters': [{'type': 'unused'}]}, session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['LaunchConfigurationName'],
+                         'CloudClusterCopy')
+
+    def test_config_delete(self):
+        factory = self.replay_flight_data('test_launch_config_delete')
+        p = self.load_policy({
+            'name': 'delete-cfg',
+            'resource': 'launch-config',
+            'filters': [{
+                'LaunchConfigurationName': 'CloudClusterCopy'}],
+            'actions': ['delete']},
+            session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['LaunchConfigurationName'],
+                         'CloudClusterCopy')
+
+
 class AutoScalingTest(BaseTest):
+
+    def get_ec2_tags(self, ec2, instance_id):
+        results = ec2.describe_tags(
+            Filters=[
+                {'Name': 'resource-id',
+                 'Values': [instance_id]},
+                {'Name': 'resource-type',
+                 'Values': ['instance']}])['Tags']
+        return {t['Key']: t['Value'] for t in results}
+        
+
+    def test_asg_delete(self):
+        factory = self.replay_flight_data('test_asg_delete')
+        p = self.load_policy({
+            'name': 'asg-delete',
+            'resource': 'asg',
+            'filters': [
+                {'AutoScalingGroupName': 'ContainersFTW'}],
+            'actions': [{'type': 'delete', 'force': True}]},
+            session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['AutoScalingGroupName'], 'ContainersFTW')
 
     def test_asg_non_encrypted_filter(self):
         factory = self.replay_flight_data('test_asg_non_encrypted_filter')
@@ -107,13 +158,7 @@ class AutoScalingTest(BaseTest):
         self.assertEqual(tag_map['CustomerId'][0], 'GetSome')
         self.assertEqual(tag_map['CustomerId'][1], True)
 
-        results = ec2.describe_tags(
-            Filters=[
-                {'Name': 'resource-id',
-                 'Values': [instance_id]},
-                {'Name': 'resource-type',
-                 'Values': ['instance']}])['Tags']
-        tag_map = {t['Key']: t['Value'] for t in results}
+        tag_map = self.get_ec2_tags(ec2, instance_id)
         self.assertTrue('CustomerId' in tag_map)
         self.assertFalse('Home' in tag_map)
 
@@ -141,7 +186,7 @@ class AutoScalingTest(BaseTest):
     def test_asg_mark_for_op(self):
         factory = self.replay_flight_data('test_asg_mark_for_op')
         p = self.load_policy({
-            'name': 'asg-rename-tag',
+            'name': 'asg-mark-for-op',
             'resource': 'asg',
             'filters': [
                 {'tag:Platform': 'ubuntu'}],
@@ -171,9 +216,25 @@ class AutoScalingTest(BaseTest):
                 {'type': 'rename-tag', 'source': 'Platform', 'dest': 'Linux'}
                 ],
             }, session_factory=factory)
+
+        # Fetch ASG
+        session = factory()
+        client = session.client('autoscaling')
+        result = client.describe_auto_scaling_groups()['AutoScalingGroups'].pop()
+
+        # Fetch instance and make sure it has tags
+        ec2 = session.client('ec2')
+        instance_id = result['Instances'][0]['InstanceId']
+
+        tag_map = self.get_ec2_tags(ec2, instance_id)
+        self.assertTrue('Platform' in tag_map)
+        self.assertFalse('Linux' in tag_map)
+
+        # Run the policy
         resources = p.run()
         self.assertEqual(len(resources), 1)
-        client = factory().client('autoscaling')
+
+        # Validate the ASG tag changed
         result = client.describe_auto_scaling_groups(
             AutoScalingGroupNames=[resources[0]['AutoScalingGroupName']])[
                 'AutoScalingGroups'].pop()
@@ -181,6 +242,11 @@ class AutoScalingTest(BaseTest):
                    for t in result['Tags']}
         self.assertFalse('Platform' in tag_map)
         self.assertTrue('Linux' in tag_map)
+
+        tag_map = self.get_ec2_tags(ec2, instance_id)
+        self.assertFalse('Platform' in tag_map)
+        self.assertTrue('Linux' in tag_map)
+
 
     def test_asg_suspend(self):
         factory = self.replay_flight_data('test_asg_suspend')
@@ -216,3 +282,75 @@ class AutoScalingTest(BaseTest):
             AutoScalingGroupNames=[resources[0]['AutoScalingGroupName']])[
                 'AutoScalingGroups'].pop()
         self.assertFalse(result['SuspendedProcesses'])
+
+    def test_asg_invalid_filter_good(self):
+        factory = self.replay_flight_data('test_asg_invalid_filter_good')
+        p = self.load_policy({
+            'name': 'asg-invalid-filter',
+            'resource': 'asg',
+            'filters': ['invalid']
+            }, session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 0)
+
+    def test_asg_invalid_filter_bad(self):
+        factory = self.replay_flight_data('test_asg_invalid_filter_bad')
+        p = self.load_policy({
+            'name': 'asg-invalid-filter',
+            'resource': 'asg',
+            'filters': ['invalid']
+            }, session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+
+        s = set([x[0] for x in resources[0]['Invalid']])
+        self.assertTrue('invalid-subnet' in s)
+        self.assertTrue('invalid-security-group' in s)
+
+    def test_asg_subnet(self):
+        factory = self.replay_flight_data('test_asg_subnet')
+        p = self.load_policy({
+            'name': 'asg-sub',
+            'resource': 'asg',
+            'filters': [
+                {'type': 'subnet',
+                 'match-resource': True,
+                 'key': 'tag:NetworkLocation',
+                 'value': ''}]},
+            session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(
+            sorted(resources[0]['c7n.matched-subnets']),
+            sorted(['subnet-65dbce1d', 'subnet-b77a4ffd', 'subnet-db9f62b2']))
+
+    def test_asg_security_group_not_matched(self):
+        factory = self.replay_flight_data(
+            'test_asg_security_group_not_matched')
+        p = self.load_policy({
+            'name': 'asg-sg',
+            'resource': 'asg',
+            'filters': [
+                {'type': 'security-group',
+                 'key': 'tag:NetworkLocation',
+                 'op': 'not-equal',
+                 'value': ''}],
+            }, session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(
+            resources[0]['c7n.matched-security-groups'], ['sg-aa6c90c3'])
+
+    def test_asg_security_group(self):
+        factory = self.replay_flight_data('test_asg_security_group')
+        p = self.load_policy({
+            'name': 'asg-sg',
+            'resource': 'asg',
+            'filters': [
+                {'type': 'security-group',
+                 'key': 'GroupName',
+                 'value': 'default'}],
+            }, session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['AutoScalingGroupName'], 'ContainersFTW')

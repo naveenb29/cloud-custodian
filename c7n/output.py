@@ -120,9 +120,9 @@ class LogOutput(object):
         return self
 
     def __exit__(self, exc_type=None, exc_value=None, exc_traceback=None):
+        self.leave_log()
         if exc_type is not None:
             log.exception("Error while executing policy")
-        self.leave_log()
 
     def join_log(self):
         self.handler = self.get_handler()
@@ -188,6 +188,9 @@ class FSOutput(LogOutput):
                         shutil.copyfileobj(sfh, zfh, length=2**15)
                     os.remove(fp)
 
+    def use_s3(self):
+        raise NotImplementedError()  # pragma: no cover
+
 
 class DirectoryOutput(FSOutput):
 
@@ -201,6 +204,9 @@ class DirectoryOutput(FSOutput):
 
     def __repr__(self):
         return "<%s to dir:%s>" % (self.__class__.__name__, self.root_dir)
+
+    def use_s3(self):
+        return False
 
 
 class S3Output(FSOutput):
@@ -260,5 +266,8 @@ class S3Output(FSOutput):
                     extra_args={
                         'ServerSideEncryption': 'AES256'})
 
-s3_join = S3Output.join
+    def use_s3(self):
+        return True
 
+
+s3_join = S3Output.join
